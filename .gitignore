@@ -1,0 +1,7 @@
+# macOS / Python cruft
+.DS_Store
+__pycache__/
+*.pyc
+
+# the tool's own test file, in case a run is interrupted
+.usb_speed_test.bin
