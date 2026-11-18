@@ -30,7 +30,18 @@ nothing.**
 - macOS (uses `system_profiler` and `diskutil`)
 - The built-in Python 3 — no extra packages to install
 
+## Getting it
+
+```bash
+git clone https://github.com/DCodeAus/usb-speed-check.git
+cd usb-speed-check
+```
+
+(Or just download `usb_speed.py` on its own — it's a single file.)
+
 ## Usage
+
+Plug in the drive, then from inside the folder:
 
 ```bash
 python3 usb_speed.py                 # pick from your plugged-in USB drives
@@ -60,3 +71,11 @@ Link:   USB 3.1 Gen 2 (10 Gb/s)
   one, throughput is skipped and the link speed is reported on its own.
 - If a reading comes back implausibly high, it was served from the cache; the
   tool says so rather than reporting a fake number.
+- Works with any external drive at any speed — a cheap USB stick, a 10 Gb/s
+  SSD like the Samsung T7, or faster. For a very fast drive, make sure the test
+  file is bigger than `--size` (default 1 GiB) so the read lasts long enough to
+  time accurately; bump `--size` up on quick drives.
+- **Thunderbolt / NVMe drives:** these connect over PCIe, not USB, so macOS
+  doesn't report a USB "link speed" for them — you'll still get the read
+  throughput, just not the link line. The tool is aimed at USB drives and
+  cables.
