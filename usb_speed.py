@@ -12,21 +12,28 @@ things and compares them:
      macOS. If a fast drive negotiates a slow link, the cable or the port is
      the weak link. That's the usual way a bad/old cable shows up.
 
-  2. The real throughput  — it writes a test file to the drive and reads it
-     back, timing both, to show the MB/s you actually get.
+  2. The real throughput  — it times how fast it can READ a large file that is
+     already on the drive, to show the MB/s you actually get.
 
 Then it tells you, in plain English, whether the cable is holding you back.
+
+Why read, not write? On macOS the OS caches writes in RAM, so a write test
+reports the speed of RAM (many GB/s), not the drive — especially on exFAT,
+where the only way to force a write to disk (fsync) is painfully slow. Timing a
+read of a real, already-stored file sidesteps all that, adds no drive wear, and
+is accurate as long as the file wasn't just accessed. The tool also sanity-
+checks the number and discards it if it looks like it came from the cache.
 
 How to run it
 -------------
     python3 usb_speed.py                 # pick from your plugged-in USB drives
     python3 usb_speed.py "T7 Shield"     # test a drive by name
     python3 usb_speed.py /Volumes/T7\\ Shield
-    python3 usb_speed.py --size 2        # use a 2 GiB test file (default 1)
-    python3 usb_speed.py --read-only     # only time reading (needs the file to exist)
+    python3 usb_speed.py --size 2        # read up to 2 GiB when timing (default 1)
+    python3 usb_speed.py --no-throughput # just report the negotiated link speed
 
-No extra packages needed — just the Python 3 that ships with macOS.
-The test file is created and then deleted automatically.
+No extra packages needed — just the Python 3 that ships with macOS. The tool
+only reads from the drive; it writes nothing.
 """
 
 from __future__ import annotations
@@ -126,55 +133,53 @@ def negotiated_speed(disk: str):
     return SPEED_TIERS.get(raw, (raw.replace("_", " "), 0))
 
 
-def benchmark(mount: str, size_gib: float, do_write: bool, do_read: bool) -> dict:
-    """Write a test file then read it back (uncached), timing each phase.
-    Speeds are in MB/s (decimal millions of bytes, like drive specs use)."""
-    path = os.path.join(mount, ".usb_speed_test.bin")
-    nbytes = int(size_gib * 1024 ** 3)
-    chunk = 8 * 1024 * 1024  # 8 MiB blocks
-    buf = os.urandom(chunk)  # random data: fair to drives that compress zeros
-    result = {}
+MIN_TEST_FILE = 256 * 1024 ** 2  # smallest existing file worth timing (256 MiB)
 
-    if do_write:
-        start = time.monotonic()
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            written = 0
-            while written < nbytes:
-                written += os.write(fd, buf)
-            os.fsync(fd)  # force it to the drive, not just the OS buffer
-        finally:
-            os.close(fd)
-        result["write"] = written / (time.monotonic() - start) / 1e6
 
-    if do_read:
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                "No test file to read. Run a write test first (drop --read-only)."
-            )
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            # Ask macOS to bypass its cache so we measure the drive, not RAM.
+def find_large_file(mount: str, min_bytes: int = MIN_TEST_FILE) -> str | None:
+    """Find an existing file on the drive big enough to time a read against.
+
+    We measure throughput by READING a file that is already on the drive —
+    never by writing. On macOS + exFAT, writes just land in RAM cache (so a
+    write test reports fantasy speeds) and the only way to force them to disk,
+    fsync, crawls. Reading a real, already-stored file avoids all of that, adds
+    no drive wear, and is cache-free as long as the file wasn't just accessed.
+    """
+    for root, dirs, files in os.walk(mount):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]  # skip hidden dirs
+        for name in files:
+            if name.startswith("."):
+                continue
+            path = os.path.join(root, name)
             try:
-                ctypes.CDLL("libc.dylib", use_errno=True).fcntl(fd, F_NOCACHE, 1)
-            except Exception:
-                pass  # worst case we get a cache-influenced number
-            start = time.monotonic()
-            read = 0
-            while True:
-                data = os.read(fd, chunk)
-                if not data:
-                    break
-                read += len(data)
-        finally:
-            os.close(fd)
-        result["read"] = read / (time.monotonic() - start) / 1e6
+                if os.path.getsize(path) >= min_bytes:
+                    return path
+            except OSError:
+                continue
+    return None
 
+
+def read_speed(path: str, cap_gib: float) -> float:
+    """Read up to cap_gib from a file, bypassing the cache, and return MB/s."""
+    chunk = 8 * 1024 * 1024  # 8 MiB blocks
+    cap = int(cap_gib * 1024 ** 3)
+    fd = os.open(path, os.O_RDONLY)
     try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    return result
+        # Ask macOS to bypass its cache so we measure the drive, not RAM.
+        try:
+            ctypes.CDLL("libc.dylib", use_errno=True).fcntl(fd, F_NOCACHE, 1)
+        except Exception:
+            pass
+        start = time.monotonic()
+        read = 0
+        while read < cap:
+            data = os.read(fd, chunk)
+            if not data:
+                break
+            read += len(data)
+    finally:
+        os.close(fd)
+    return read / (time.monotonic() - start) / 1e6
 
 
 def pick_volume(volumes: list[dict], query: str | None) -> dict:
@@ -199,24 +204,40 @@ def pick_volume(volumes: list[dict], query: str | None) -> dict:
         sys.exit("Not a valid choice.")
 
 
-def verdict(label: str, practical: float, best: float) -> str:
-    """Plain-English judgement comparing measured speed to the link's ceiling."""
-    if not best:
-        return ""
+def looks_cached(speed: float, practical: float) -> bool:
+    """A read far above the link's ceiling can only have come from RAM cache."""
+    if practical:
+        return speed > practical * 1.4
+    return speed > 1500  # no link info: assume cached if it beats any real USB link
+
+
+def link_verdict(label: str, practical: float) -> str:
+    """Verdict based on the negotiated link speed alone (always reliable)."""
     if not practical:
-        return ("ℹ️  Measured the throughput, but couldn't read the link speed "
-                "to compare against.")
+        return "ℹ️  Couldn't read the negotiated link speed on this Mac."
     if practical <= 45:  # USB 2.0 or slower
         return ("⚠️  This link negotiated USB 2.0 speed (or slower). A fast drive "
                 "stuck here is almost always a slow/old cable or a USB 2.0 port.\n"
                 "    Try a USB 3+ (or Thunderbolt) cable and a USB 3+ port.")
-    pct = best / practical * 100
-    if pct >= 55:
-        return (f"✅  You're getting about {pct:.0f}% of this link's practical "
-                "ceiling — that's normal. The cable is NOT the bottleneck.")
-    return (f"🟡  Measured speed is only ~{pct:.0f}% of what this {label} link "
-            "can do.\n    That can be the drive itself, a busy drive, or a "
-            "marginal cable. Re-run; if it stays low, try another cable/port.")
+    return (f"✅  The cable and port negotiated {label} — a fast link, so the "
+            "cable is not limiting you here.")
+
+
+def throughput_note(speed: float, label: str, practical: float) -> str:
+    """One line interpreting the measured read speed (or why it's unavailable)."""
+    if not speed:
+        return ("ℹ️  No file ≥256 MiB on the drive to time a read against, so "
+                "throughput wasn't measured. The link speed above is the reliable "
+                "figure; copy a large file over if you want a throughput number.")
+    if looks_cached(speed, practical):
+        return (f"ℹ️  The read came back at {speed:,.0f} MB/s — that's the RAM "
+                "cache, not the drive, so it's not a real throughput figure. The "
+                "link speed above is the reliable one.")
+    if practical:
+        pct = speed / practical * 100
+        return (f"    Real read throughput: {speed:,.0f} MB/s (~{pct:.0f}% of this "
+                "link's practical ceiling — normal for a drive like this).")
+    return f"    Real read throughput: {speed:,.0f} MB/s."
 
 
 def main() -> None:
@@ -230,33 +251,29 @@ def main() -> None:
     ap.add_argument("volume", nargs="?",
                     help="Drive name or /Volumes path (default: ask / auto-pick)")
     ap.add_argument("--size", type=float, default=1.0,
-                    help="Test-file size in GiB (default 1)")
-    ap.add_argument("--read-only", action="store_true", help="Only time reading")
-    ap.add_argument("--write-only", action="store_true", help="Only time writing")
+                    help="How much to read (GiB) when timing throughput (default 1)")
+    ap.add_argument("--no-throughput", action="store_true",
+                    help="Only report the negotiated link speed; skip the read test")
     args = ap.parse_args()
-
-    do_write = not args.read_only
-    do_read = not args.write_only
 
     vol = pick_volume(list_usb_volumes(), args.volume)
 
     print(f"\nDrive:  {vol['name']}  ({vol['mount']})")
     spd = negotiated_speed(vol["disk"])
-    if spd:
-        label, practical = spd
-        print(f"Link:   {label}")
-    else:
-        label, practical = "unknown", 0
-        print("Link:   could not read the negotiated speed")
-    print(f"Test:   {args.size:g} GiB  (writes a temp file, then deletes it)\n")
+    label, practical = spd if spd else ("unknown", 0)
+    print(f"Link:   {label if spd else 'could not read the negotiated speed'}")
+    print()
+    print(link_verdict(label, practical))
 
-    res = benchmark(vol["mount"], args.size, do_write, do_read)
-    if "write" in res:
-        print(f"  Write: {res['write']:7.0f} MB/s")
-    if "read" in res:
-        print(f"  Read:  {res['read']:7.0f} MB/s")
+    if args.no_throughput:
+        print()
+        return
 
-    print("\n" + verdict(label, practical, max(res.values()) if res else 0) + "\n")
+    big = find_large_file(vol["mount"])
+    speed = read_speed(big, args.size) if big else 0.0
+    print()
+    print(throughput_note(speed, label, practical))
+    print()
 
 
 if __name__ == "__main__":
